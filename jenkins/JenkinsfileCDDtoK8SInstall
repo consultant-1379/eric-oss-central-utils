@@ -1,0 +1,165 @@
+pipeline {
+    agent {
+        node {
+            label 'gazelles_podj'
+        }
+    }
+    tools {
+        jdk 'jdk8'
+    }
+    options {
+        skipDefaultCheckout true
+        timestamps()
+        timeout(time: 1, unit: 'HOURS')
+        buildDiscarder(logRotator(numToKeepStr: '40', artifactNumToKeepStr: '20'))
+    }
+    environment {
+        CREDENTIALS_SERO_ARTIFACTORY = credentials ('osscnciArtifactoryApiKeySERO')
+
+        KUBECTL_CMD = "docker run --rm \
+            -v ${WORKSPACE}/.kube/config:/root/.kube/config \
+            -v ${WORKSPACE}:${WORKSPACE} \
+            ${KUBECTL_DOCKER_IMAGE}"
+        HELM_CMD = "docker run --rm \
+            -v ${WORKSPACE}/.kube/config:/root/.kube/config \
+            -v ${WORKSPACE}/helm-home:/root/.helm \
+            -v ${WORKSPACE}:${WORKSPACE} \
+            ${HELM_DOCKER_IMAGE}"
+        HELM_SET = "global.registry.pullSecret=registrykey"
+        HELM_CHART_REPO = "https://arm.sero.gic.ericsson.se/artifactory/proj-swdp-cdd-drop-helm/"
+        HELM_CHART_PACKAGED = "${WORKSPACE}/eric-swdp-cdd-${CDD_VERSION}.tgz"
+        HELM_INSTALL_RELEASE_NAME = "${params.K8S_CDD_NAMESPACE}"
+        HELM_INSTALL_NAMESPACE = "${HELM_INSTALL_RELEASE_NAME}"
+        HELM_INSTALL_TIMEOUT = 900
+    }
+    stages {
+        stage('Clean') {
+            steps {
+                sh '''
+                   echo "Cleanup workspace"
+                   sudo chmod -fR 777 "${WORKSPACE}"
+                   sudo rm -Rf ./*
+                '''
+            }
+        }
+        stage('Init') {
+            steps {
+                echo 'Inject k8s config file:'
+                script{
+                    // Get file using input step, will put it in build directory
+                    print "=================Please upload your K8S config file====================="
+                    def inputFile = input message: 'Upload K8S config file', parameters: [file(name: 'config')]
+                    // Read contents and write to workspace
+                    writeFile(file: 'config', text: inputFile.readToString())
+                    // Stash it for use in a different part of the pipeline
+                    stash name: 'k8s_config', includes: 'config'
+                }
+                dir('.kube') {
+                    unstash 'k8s_config'
+                }
+                echo 'Checking K8S cluster availability:'
+                sh "${KUBECTL_CMD} cluster-info"
+                
+                echo 'Prepare Helm:'
+                sh '${HELM_CMD} init --client-only'
+                sh '${HELM_CMD} repo add eric-swdp-cdd ${HELM_CHART_REPO} --username ${CREDENTIALS_SERO_ARTIFACTORY_USR} --password ${CREDENTIALS_SERO_ARTIFACTORY_PSW}'
+                sh '${HELM_CMD} repo update'        
+            }
+        }
+       stage('Helm Dry-run') {
+            when {
+                expression { params.INSTALLATION_TYPE == "HELM_CHART" }
+            }
+            steps {
+                sh """
+                    wget --user=${CREDENTIALS_SERO_ARTIFACTORY_USR} --password=${CREDENTIALS_SERO_ARTIFACTORY_PSW} https://arm.sero.gic.ericsson.se/artifactory/proj-swdp-cdd-drop-helm/eric-swdp-cdd/eric-swdp-cdd-${CDD_VERSION}.tgz
+                    tar -zxvf eric-swdp-cdd-${params.CDD_VERSION}.tgz
+                """ 
+                sh """
+                    ${HELM_CMD} install \
+                        ${WORKSPACE}/eric-swdp-cdd/ \
+                        --name ${HELM_INSTALL_RELEASE_NAME} \
+                        --namespace ${HELM_INSTALL_NAMESPACE} \
+                        --timeout ${HELM_INSTALL_TIMEOUT} \
+                        --set ${HELM_SET} \
+                        --values ${WORKSPACE}/eric-swdp-cdd/values.yaml \
+                        --values ${WORKSPACE}/eric-swdp-cdd/values_common_config.yaml \
+                        --values ${WORKSPACE}/eric-swdp-cdd/values_spinnaker_local.yaml \
+                        --dry-run --debug > swdp-cdd-dry-run-output.yaml || true
+                """
+                archiveArtifacts 'swdp-cdd-dry-run-output.yaml'
+            }
+        }
+        stage('CDD env install within HELM CHART') {
+            when {
+                expression { params.INSTALLATION_TYPE == "HELM_CHART" }
+            }
+            steps {
+                script {
+                    if (params.PRIOR_CLEANUP_CDD_RELEASE) {
+                        sh """
+                            ${HELM_CMD} delete ${HELM_INSTALL_RELEASE_NAME} --purge --no-hooks --timeout 180 || true
+                            sleep 10
+                            ${KUBECTL_CMD} delete ns ${HELM_INSTALL_NAMESPACE} || true
+                        """
+                    }
+                }
+                sh """
+                    time ${HELM_CMD} upgrade ${HELM_INSTALL_RELEASE_NAME} \
+                    --install ${WORKSPACE}/eric-swdp-cdd/ \
+                    --namespace ${HELM_INSTALL_NAMESPACE} \
+                    --timeout ${HELM_INSTALL_TIMEOUT} \
+                    --set ${HELM_SET} \
+                    --values ${WORKSPACE}/eric-swdp-cdd/values.yaml \
+                    --values ${WORKSPACE}/eric-swdp-cdd/values_common_config.yaml \
+                    --values ${WORKSPACE}/eric-swdp-cdd/values_spinnaker_local.yaml \
+                    --wait || true
+                """
+                sh """
+                    set +x
+                    ${KUBECTL_CMD} expose svc jenkins --type=LoadBalancer --name=jenkins-cdd -n cdd-app &>/dev/null || true
+                    echo "Jenkins instance healthcheck:"
+                    echo "\$(curl -I -u swdp:ericsson \$(${KUBECTL_CMD} get svc jenkins-cdd -n cdd-app -o jsonpath="{.status.loadBalancer.ingress[*].ip}"):8080)"
+                    echo "Jenkins URL: http://\$(${KUBECTL_CMD} get svc jenkins-cdd -n cdd-app -o jsonpath="{.status.loadBalancer.ingress[*].ip}"):8080" | tee Jenkins_Spinnaker_URLs.values
+                    echo "-----------------------------------------------------------------------------------------"
+                    ${KUBECTL_CMD} expose svc spin-deck --type=LoadBalancer --name=spin-deck-cdd -n cdd-app &>/dev/null || true
+                    echo "Spinnaker instance healthcheck:"
+                    echo "\$(curl -I \$(${KUBECTL_CMD} get svc spin-deck-cdd -n cdd-app -o jsonpath="{.status.loadBalancer.ingress[*].ip}"):9000)"
+                    echo "Spinnaker URL: http://\$(${KUBECTL_CMD} get svc spin-deck-cdd -n cdd-app -o jsonpath="{.status.loadBalancer.ingress[*].ip}"):9000" | tee -a Jenkins_Spinnaker_URLs.values
+                """
+                archiveArtifacts 'Jenkins_Spinnaker_URLs.values'                                       
+            }
+        }
+        stage('CDD env install within CSAR') {
+            when {
+                expression { params.INSTALLATION_TYPE == "CSAR" }
+            }
+            steps {
+                sh 'echo "Placholder for future SWDP-CDD installation stage with CSAR package"'
+            }
+        }
+    }
+    post {
+        always {
+            script {
+                echo "Placholder for post/always"
+            }
+        }
+        success {
+            script {
+                echo "Success build completion."
+            }
+        }
+        failure {
+            script {
+                echo "Something went wrong...\nCleanup ${HELM_INSTALL_RELEASE_NAME} release and ${HELM_INSTALL_NAMESPACE} namespace if exist:"
+                sh """
+                    ${HELM_CMD} delete ${HELM_INSTALL_RELEASE_NAME} --purge --no-hooks --timeout 180 || true
+                    sleep 10
+                    ${KUBECTL_CMD} delete ns ${HELM_INSTALL_NAMESPACE} || true
+                """
+                echo "Done"
+            }
+        }
+    }
+}

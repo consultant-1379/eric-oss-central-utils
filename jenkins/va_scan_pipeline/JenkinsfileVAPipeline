@@ -1,0 +1,241 @@
+pipeline {
+    agent {
+        node {
+            label 'gazelles_podj'
+        }
+    }
+    options {
+        skipDefaultCheckout true
+        timestamps()
+        timeout(time: 60, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '40', artifactNumToKeepStr: '40'))
+    }
+    environment {
+        CREDENTIALS_SERO_ARTIFACTORY = credentials ('osscnciArtifactoryApiKeySERO')
+        CREDENTIALS_SELI_ARTIFACTORY = credentials ('osscnciArtifactoryApiKeySELI')
+        //USERNAME = "${${ARTIFACTORY_CREDENTIAL_NAME}_USR}"
+        //PASSWORD = "${${ARTIFACTORY_CREDENTIAL_NAME}_PSW}"
+        ARM_XRAY_SELI_SERVER = "https://armxray.seli.gic.ericsson.se/api"
+        BOB_DOCKER_IMAGE_LATEST="armdocker.rnd.ericsson.se/proj-adp-cicd-drop/bob.2.0:latest"
+        KUBECTL_CMD = "docker run --rm \
+            -v ${WORKSPACE}/.kube/config:/root/.kube/config \
+            ${KUBECTL_DOCKER_IMAGE}"
+        BOB = "docker run --rm \
+            --env CREDENTIALS_SERO_ARTIFACTORY_USR=${CREDENTIALS_SERO_ARTIFACTORY_USR} \
+            --env CREDENTIALS_SERO_ARTIFACTORY_PSW=${CREDENTIALS_SERO_ARTIFACTORY_PSW} \
+            -v ${WORKSPACE}:${WORKSPACE} \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -w ${WORKSPACE} \
+            ${BOB_DOCKER_IMAGE}"
+        BOB_XRAY = "docker run --rm \
+            --user \$(id -u):\$(getent group docker | cut -d: -f3) \
+            --env PROJECT_NAME=${PROJECT_NAME} \
+            --env IMAGE_NAME=${IMAGE_NAME} \
+            --env IMAGE_VERSION=${IMAGE_VERSION} \
+            --env ARM_XRAY_SELI_SERVER=${ARM_XRAY_SELI_SERVER} \
+            --env CREDENTIALS_SELI_ARTIFACTORY_USR=${CREDENTIALS_SELI_ARTIFACTORY_USR} \
+            --env CREDENTIALS_SELI_ARTIFACTORY_PSW=${CREDENTIALS_SELI_ARTIFACTORY_PSW} \
+            -v ${WORKSPACE}:${WORKSPACE} \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -w ${WORKSPACE} \
+            ${BOB_DOCKER_IMAGE_LATEST}"
+        HELM_CMD = "docker run --rm \
+            -v ${WORKSPACE}/.kube/config:/root/.kube/config \
+            -v ${WORKSPACE}/helm-home:/root/.helm \
+            -v ${WORKSPACE}:${WORKSPACE} \
+            ${HELM_DOCKER_IMAGE}"
+        HELM3_CMD = "docker run --rm \
+            -v ${WORKSPACE}/.kube/config:/root/.kube/config \
+            -v ${WORKSPACE}/.config/helm:/root/.config/helm \
+            -v ${WORKSPACE}/.local/share/helm:/root/.local/share/helm \
+            -v ${WORKSPACE}/.cache/helm:/root/.cache/helm \
+            -v ${WORKSPACE}:${WORKSPACE} \
+            ${HELM3_DOCKER_IMAGE}"
+        HELM_CHART = "https://${HELM_REGISTRY_URI}/artifactory/${PROJECT_NAME}-helm/${IMAGE_NAME}/${params.IMAGE_NAME}-${params.IMAGE_VERSION}.tgz"
+        HELM_INSTALL_TIMEOUT = 1800
+        HELM3_INSTALL_TIMEOUT = "${HELM_INSTALL_TIMEOUT}s"
+        HELM_INSTALL_RELEASE_NAME = "${params.IMAGE_NAME}-install"
+    }
+    stages {
+        stage('Clean') {
+            steps {
+                sh '''
+                    echo "Cleanup workspace"
+                    sudo chmod -fR 777 "${WORKSPACE}"
+                    sudo rm -Rf ./*
+                '''
+            }
+        }
+        stage('Init') {
+            steps {
+                script {
+                    echo 'Init Stage'
+                    echo 'Inject k8s config file:'
+                    configFileProvider([configFile(fileId: "$HAHN083_KUBE_CONFIG", targetLocation: "${env.WORKSPACE}/")]) {}
+
+                    echo 'Inject VA scan pipeline ruleset file and ZAP config and error codes file'
+                    addfilesToWs()
+
+
+                    echo "Inject OS Release file for Trivy scan"
+                    configFileProvider([configFile(fileId: "$OS_RELEASE_FILE", targetLocation: "${env.WORKSPACE}/")]) {}
+
+                    sh """
+                        set +x
+                        mkdir -p .bob
+                        echo ${params.DOCKER_REGISTRY_URI}/${params.PROJECT_NAME}/${params.IMAGE_NAME}:${params.IMAGE_VERSION} > .bob/var.IMAGETOSCAN
+                        cat .bob/var.IMAGETOSCAN
+                    """
+                    echo 'Checking K8S cluster availability:'
+                    sh "${KUBECTL_CMD} cluster-info"
+                    sh """
+                        echo "Setting bob parameters"
+                        set +x
+                        echo ${params.IMAGE_NAME} > .bob/var.IMAGE_NAME_ENV
+                        echo ${params.IMAGE_VERSION} > .bob/var.IMAGE_VERSION_ENV
+                        echo ${params.SERVICE_PORT} > .bob/var.SERVICE_PORT
+                        echo ${params.RELEASE_NAMESPACE} > .bob/var.RELEASE_NAMESPACE_ENV
+                        echo ${params.REPORT_FORMAT} > .bob/var.REPORT_FORMAT
+                        echo "${params.CVE_IGNORE_CODES}" > .trivyignore
+                    """
+
+                    echo "Cleaning up previous installations"
+                    cleanupHelmReleasesNamespaces(HELM_INSTALL_RELEASE_NAME, RELEASE_NAMESPACE)
+                }
+            }
+        }
+        stage('HELM install') {
+            steps {
+                script {
+                    echo 'Helm install of the service helm chart:'
+                    sh "${KUBECTL_CMD} create ns ${params.RELEASE_NAMESPACE} || true"
+                    sh "${KUBECTL_CMD} create secret docker-registry ${params.IMAGE_NAME}-secret \
+                        --docker-server=${params.DOCKER_REGISTRY_URI} \
+                        --docker-username=${CREDENTIALS_SELI_ARTIFACTORY_USR} \
+                        --docker-password=${CREDENTIALS_SELI_ARTIFACTORY_PSW} \
+                        -n ${params.RELEASE_NAMESPACE} || true"
+                    if (env.HELM3 == "true"){
+                        sh '${HELM3_CMD} upgrade \
+                            --install ${HELM_INSTALL_RELEASE_NAME} ${HELM_CHART} \
+                            --namespace ${RELEASE_NAMESPACE}'
+                    } else {
+                        sh '${HELM_CMD} upgrade \
+                            --install ${HELM_INSTALL_RELEASE_NAME} ${HELM_CHART} \
+                            --namespace ${params.RELEASE_NAMESPACE}'
+                    }
+                }
+            }
+        }
+        stage('ZAP scanning') {
+            steps {
+                script {
+                    sh """
+                        sed -i 's|//.*|//${IMAGE_NAME}.${RELEASE_NAMESPACE}:${SERVICE_PORT}"|' zap_config.yaml
+                        cat ruleset2.0.yaml
+                        cat zap_config.yaml
+                        time ${BOB} zap-test || true
+                        cat zap_scan_error_codes
+                    """
+
+                }
+            }
+        }
+        stage('Anchore Scanning') {
+            steps {
+                script {
+                    echo "Anchore Scanning Stage"
+                    sh """
+                        time ${BOB} anchore-inline-scan || true
+                    """
+                }
+            }
+        }
+        stage('Trivy scanning') {
+            steps {
+                script {
+                    def EXIT_STATUS  = sh(script:"set +x; set -o pipefail; ${BOB} scan:trivy-inline-scan | tee scan_console.output", returnStatus:true)
+                    env.result = EXIT_STATUS
+
+                    def output = sh(script:"set +x; grep -q 'OS is not detected' scan_console.output", returnStatus:true)
+                    if ( result !=0 || output ==0 )
+                    {
+                        sh """
+                            set +x
+                            echo 'Fixing issue with /etc/os-release file'
+                            echo "FROM ${params.DOCKER_REGISTRY_URI}/${params.PROJECT_NAME}/${params.IMAGE_NAME}:${params.IMAGE_VERSION}" > Dockerfile
+                            echo "COPY os-release /etc/os-release" >> Dockerfile
+                            docker build -t image_with_fixed_os_release_file:1.0 .
+                            docker save -o docker.tar image_with_fixed_os_release_file:1.0
+                            echo docker.tar > .bob/var.IMAGETOSCAN
+
+                            time ${BOB} trivy-scan:trivy-inline-scan-with-tar || true
+                        """
+                    }
+                }
+            }
+        }
+        stage('X-Ray Scanning') {
+            steps {
+                sh "time ${BOB_XRAY} fetch-xray-report | tee eric-oss-x-ray-va-report.md >/dev/null 2>&1 || true"
+            }
+        }
+        stage('Tenable.sc Scanning') {
+            steps {
+                echo "Placeholder for Tenable.sc scanning tool"
+            }
+        }
+    }
+    post {
+        always {
+            script {
+                archiveArtifacts allowEmptyArchive: true, artifacts: 'anchore-reports/**.*'
+                archiveArtifacts allowEmptyArchive: true, artifacts: 'trivy_scan.report'
+                archiveArtifacts allowEmptyArchive: true, artifacts: 'zap/reports/**.*'
+                archiveArtifacts allowEmptyArchive: true, artifacts: 'eric-oss-x-ray-va-report.md'
+
+                echo "Cleaning up installations"
+                cleanupHelmReleasesNamespaces(HELM_INSTALL_RELEASE_NAME, RELEASE_NAMESPACE)
+                emailext to: 'PDLAZELLES@pdl.internal.ericsson.com', recipientProviders: [culprits(), developers(), requestor(), brokenBuildSuspects()], subject: "eric-oss-vulnerability-analysis-pipeline status", body: "<b>Jenkins job:</b><br><br>Project: ${env.JOB_NAME}<br>Build Number: ${env.BUILD_NUMBER}<br>${env.BUILD_URL}<br>Please heck the reports in the build artifacts", mimeType: 'text/html'
+            }
+        }
+        success {
+            script {
+                echo "Placeholder for the Post Success"
+            }
+        }
+        failure {
+            script {
+                echo "Placeholder for the Post Failure"
+            }
+        }
+    }
+}
+
+
+def cleanupHelmReleasesNamespaces(HELM_INSTALL_RELEASE_NAME, RELEASE_NAMESPACE) {
+    echo 'Cleanup helm release and namespaces...'
+
+    if (env.HELM3 == "true"){
+        sh "$HELM3_CMD uninstall $HELM_INSTALL_RELEASE_NAME -n $RELEASE_NAMESPACE|| true"
+    } else {
+        sh "$HELM_CMD delete --purge $HELM_INSTALL_RELEASE_NAME || true"
+    }
+
+    sh '''
+        $KUBECTL_CMD get namespaces || true
+        $KUBECTL_CMD delete namespace $RELEASE_NAMESPACE || true
+        $KUBECTL_CMD get namespaces || true
+        sleep 30
+    '''
+
+}
+
+def addfilesToWs() {
+    dir('eric-oss-central-utils') {
+        git url: 'ssh://gerrit.ericsson.se:29418/OSS/com.ericsson.oss.ci/eric-oss-central-utils.git'
+    }
+    sh "mv ${env.WORKSPACE}/jenkins/va_scan_pipeline/VAScan_ruleset2.0.yaml ${env.WORKSPACE}/ruleset2.0.yaml"
+    sh "mv ${env.WORKSPACE}/jenkins/va_scan_pipeline/zap_config.yaml ${env.WORKSPACE}/zap_config.yaml"
+    sh "mv ${env.WORKSPACE}/jenkins/va_scan_pipeline/zap_scan_error_codes ${env.WORKSPACE}/zap_scan_error_codes"
+    sh "rm -rf ${env.WORKSPACE}/eric-oss-central-utils/"
+}

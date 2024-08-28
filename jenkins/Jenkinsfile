@@ -1,0 +1,198 @@
+@Library('eric-oss-central-utils-shared-library')
+import jenkins.utils.*
+utils = new utils()     // https://gerrit.sero.gic.ericsson.se/gitweb?p=OSS/com.ericsson.oss.ci/eric-oss-central-utils.git;a=blob_plain;f=src/jenkins/utils/utils.groovy;hb=master
+
+def defaultBobImage = 'armdocker.rnd.ericsson.se/proj-adp-cicd-drop/bob.2.0:1.7.0-52'
+def bob = new BobCommand()
+        .bobImage(defaultBobImage)
+        .envVars([ISO_VERSION: '${ISO_VERSION}'])
+        .needDockerSocket(true)
+        .toString()
+def GIT_COMMITTER_NAME = 'lciadm100'
+def GIT_COMMITTER_EMAIL = 'lciadm100@ericsson.com'
+
+pipeline {
+    agent {
+        node {
+            label DOCKER_AGENT
+        }
+    }
+    tools {
+        jdk 'jdk8'
+        maven 'maven'
+    }
+    options {
+        skipDefaultCheckout true
+        timestamps()
+        timeout(time: 1, unit: 'HOURS')
+        buildDiscarder(logRotator(numToKeepStr: '40', artifactNumToKeepStr: '20'))
+    }
+    stages {
+        stage('Clean') {
+            steps {
+                sh '''
+                    echo "Cleanup workspace"
+                    sudo chmod -fR 777 "${WORKSPACE}"
+                    sudo rm -Rf ./*
+                '''
+
+                echo 'SCM Checkout'
+                checkout scm
+            }
+        }
+        stage('Init') {
+            steps {
+                script {
+                    utils.injectFiles()
+                }
+            }
+        }
+        stage('Build') {
+            when {
+                expression { env.BUILD == "true" }
+            }
+            steps {
+                script {
+                    utils.mavenInstallWithStaticAnalysis()
+                }
+            }
+        }
+        stage('Release') {
+            when {
+                expression { env.MVN_RELEASE == "true" }
+            }
+            steps {
+                script {
+                    utils.mavenReleaseWithStaticAnalysis()
+                }
+            }
+        }
+        stage('Generate New Version Tag') {
+            steps {
+                sh "${bob} generate-new-version"
+            }
+        }
+        stage('Publish Common Ruleset To Artifactory') {
+            steps {
+                script {
+                    withCredentials([string(credentialsId: 'lciadm100_artifactory', variable: 'HELM_REPO_TOKEN')]) {
+                        def bobWithHelmToken = new BobCommand()
+                            .bobImage(defaultBobImage)
+                            .needDockerSocket(true)
+                            .envVars([
+                                'HELM_REPO_TOKEN': env.HELM_REPO_TOKEN,
+                                'ARM_COMMON_RULESET_REPO': "proj-eric-oss-drop-generic"
+                            ])
+                            .toString()
+                        sh "${bobWithHelmToken} publish"
+                    }
+                }
+            }
+            post {
+                failure {
+                    script {
+                        failedStage = env.STAGE_NAME
+                    }
+                }
+            }
+        }
+        stage('Tag Git Repository') {
+            steps {
+                wrap([$class: 'BuildUser']) {
+                    script {
+                        def bobWithCommitterInfo = new BobCommand()
+                                .bobImage(defaultBobImage)
+                                .needDockerSocket(true)
+                                .envVars([
+                                        'AUTHOR_NAME'        : "\${BUILD_USER:-${GIT_COMMITTER_NAME}}",
+                                        'AUTHOR_EMAIL'       : "\${BUILD_USER_EMAIL:-${GIT_COMMITTER_EMAIL}}",
+                                        'GIT_COMMITTER_NAME' : "${GIT_COMMITTER_NAME}",
+                                        'GIT_COMMITTER_EMAIL': "${GIT_COMMITTER_EMAIL}"
+                                ])
+                                .toString()
+                        sh "${bobWithCommitterInfo} create-git-tag"
+                        sh """
+                            tag_id=\$(cat .bob/var.version)
+                            git push ssh://gerrit.ericsson.se:29418/OSS/com.ericsson.oss.ci/eric-oss-central-utils \${tag_id}
+                        """
+                    }
+                }
+            }
+            post {
+                failure {
+                    script {
+                        failedStage = env.STAGE_NAME
+                    }
+                }
+            }
+        }
+        stage('Bump Version') {
+            steps {
+                script {
+                    sh 'hostname'
+                    Version = readFile "VERSION_PREFIX"
+                    sh 'docker run --rm -v $PWD/VERSION_PREFIX:/app/VERSION -w /app armdocker.rnd.ericsson.se/proj-enm/bump patch'
+                    newVersion = readFile "VERSION_PREFIX"
+                    env.IMAGE_VERSION = newVersion
+                    currentBuild.displayName = "${BUILD_NUMBER} - Version - " + Version
+                    sh '''
+                        git add VERSION_PREFIX
+                        git commit -m "Version $IMAGE_VERSION"
+                        git push -f ssh://gerrit.ericsson.se:29418/OSS/com.ericsson.oss.ci/eric-oss-central-utils HEAD:master
+                    '''
+                }
+            }
+        }
+    }
+    post {
+        always {
+            script {
+                utils.postAlways()
+                utils.staticAnalysisReports()
+            }
+        }
+        failure {
+            script {
+                utils.postFailure()
+            }
+        }
+    }
+}
+
+// More about @Builder: http://mrhaki.blogspot.com/2014/05/groovy-goodness-use-builder-ast.html
+import groovy.transform.builder.Builder
+import groovy.transform.builder.SimpleStrategy
+
+@Builder(builderStrategy = SimpleStrategy, prefix = '')
+class BobCommand {
+    def bobImage = 'bob.2.0:latest'
+    def envVars = [:]
+    def needDockerSocket = false
+
+    String toString() {
+        def env = envVars
+                .collect({ entry -> "-e ${entry.key}=\"${entry.value}\"" })
+                .join(' ')
+
+        def cmd = """\
+            |docker run
+            |--init
+            |--rm
+            |--workdir \${PWD}
+            |--user \$(id -u):\$(id -g)
+            |-v \${PWD}:\${PWD}
+            |-v /etc/group:/etc/group:ro
+            |-v /etc/passwd:/etc/passwd:ro
+            |-v \${HOME}/.m2:\${HOME}/.m2
+            |-v \${HOME}/.docker:\${HOME}/.docker
+            |${needDockerSocket ? '-v /var/run/docker.sock:/var/run/docker.sock' : ''}
+            |${env}
+            |\$(for group in \$(id -G); do printf ' --group-add %s' "\$group"; done)
+            |${bobImage}
+            |"""
+        return cmd
+                .stripMargin()           // remove indentation
+                .replace('\n', ' ')      // join lines
+                .replaceAll(/[ ]+/, ' ') // replace multiple spaces by one
+    }
+}

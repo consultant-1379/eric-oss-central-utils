@@ -1,0 +1,5 @@
+ZAP tool error exit codes meaning
+0: Success
+1: At least 1 FAIL
+2: At least one WARN and no FAILs
+3: Any other failure

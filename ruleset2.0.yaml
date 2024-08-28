@@ -1,0 +1,65 @@
+modelVersion: 2.0
+
+description: "OSS: Central Utils Ruleset"
+
+import:
+  imported-ruleset: pdu-oss-common-ruleset.yaml
+
+docker:
+  registry: https://armdocker.rnd.ericsson.se/proj-enm
+
+docker-images:
+  - adp-helm-dr-check: armdocker.rnd.ericsson.se/proj-adp-cicd-drop/common-library-adp-helm-dr-check:${env.ADP_HELM_DR_CHECK_TAG}
+  - adp-release-auto: armdocker.rnd.ericsson.se/proj-adp-cicd-drop/bob-adp-release-auto:${env.ADP_RELEASE_AUTO_TAG}
+
+properties:
+  - image-name: eric-enm-version-auto
+  - image-repo: https://armdocker.rnd.ericsson.se/proj-enm
+  - docker-image-path: armdocker.rnd.ericsson.se/proj-enm/${image-name}
+  - docker-internal-image-path: armdocker.rnd.ericsson.se/proj_oss_releases/enm/${image-name}
+  - common-ruleset-name: pdu-oss-common-ruleset
+
+env:
+  - ADP_HELM_DR_CHECK_TAG (default=latest)
+  - ADP_RELEASE_AUTO_TAG (default=latest)
+  - RELEASE (default=true)
+  - HELM_REPO_TOKEN
+  - BUILD_DATE (default = $(date +%d%m%Y-%H%M%S --utc))
+  - ENABLE_HELM_V3 (default=true)
+  - ARM_SERVER_FQDN (default=arm.seli.gic.ericsson.se)
+  - ARM_USER (default=lciadm100)
+  - ARM_COMMON_RULESET_REPO (default=proj-eric-oss-dev-generic)
+
+var:
+  - commit-hash
+  - version
+  - version-prefix
+  - rstate
+
+rules:
+
+  create-git-tag: imported-ruleset.create-git-tag
+
+  remove-git-tag: imported-ruleset.remove-git-tag
+
+  generate-new-version: imported-ruleset.generate-new-version
+
+  publish:
+    - task: add-version-to-common-ruleset
+      docker-image: adp-release-auto
+      cmd:
+        # Replace BOB_VERSION_AUTO_UPDATED_HERE with ${var.version}
+        - sed -i "s/BOB_VERSION_AUTO_UPDATED_HERE/${var.version}/" ${common-ruleset-name}.yaml
+    - task: publish-common-ruleset-to-generic-arm-repo
+      docker-image: adp-release-auto
+      cmd:
+        # Publish common ruleset with SemVer and latest versions to generic Artifactory repo
+        - curl -u ${env.ARM_USER}:${env.HELM_REPO_TOKEN} -X PUT -T ${common-ruleset-name}.yaml https://${env.ARM_SERVER_FQDN}/artifactory/${env.ARM_COMMON_RULESET_REPO}-local/${common-ruleset-name}/${common-ruleset-name}-${var.version}.yaml
+        - curl -u ${env.ARM_USER}:${env.HELM_REPO_TOKEN} -X PUT -T ${common-ruleset-name}.yaml https://${env.ARM_SERVER_FQDN}/artifactory/${env.ARM_COMMON_RULESET_REPO}-local/${common-ruleset-name}/${common-ruleset-name}-latest.yaml
+    - task: verify-common-ruleset-is-available
+      docker-image: adp-release-auto
+      cmd:
+        - curl -u ${env.ARM_USER}:${env.HELM_REPO_TOKEN} https://${env.ARM_SERVER_FQDN}/artifactory/${env.ARM_COMMON_RULESET_REPO}-local/${common-ruleset-name}/${common-ruleset-name}-${var.version}.yaml --output downloaded_${common-ruleset-name}-${var.version}.yaml
+        - cat downloaded_${common-ruleset-name}-${var.version}.yaml | grep 'version:' | head -n1 | awk '{print $2}'
+        - cat downloaded_${common-ruleset-name}-${var.version}.yaml
+

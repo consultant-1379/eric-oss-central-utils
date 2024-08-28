@@ -1,0 +1,158 @@
+modelVersion: 2.0
+
+description: "PDU OSS: Common Ruleset"
+
+version: BOB_VERSION_AUTO_UPDATED_HERE
+
+# See image catalog: https://confluence.lmera.ericsson.se/display/ACD/ADP+CICD+Docker+Image+Catalog
+docker-images:
+  - adp-helm-dr-check: armdocker.rnd.ericsson.se/proj-adp-cicd-drop/common-library-adp-helm-dr-check:${env.ADP_HELM_DR_CHECK_TAG}
+  - adp-release-auto: armdocker.rnd.ericsson.se/proj-adp-cicd-drop/bob-adp-release-auto:${env.ADP_RELEASE_AUTO_TAG}
+  - anchore-inline-scan: armdocker.rnd.ericsson.se/proj-adp-cicd-drop/anchore-inline-scan:${env.ANCHORE_INLINE_TAG}
+  - eric-enm-version-auto: armdocker.rnd.ericsson.se/proj-enm/eric-enm-version-auto:${env.ENM_VERSION_AUTO_TAG}
+  - eric-enm-yq: armdocker.rnd.ericsson.se/proj-enm/yq:${env.ENM_YQ_TAG}
+  - k8-test: armdocker.rnd.ericsson.se/proj-adp-cicd-drop/bob-py3kubehelmbuilder:${env.K8_TEST_TAG}
+  - trivy-inline-scan: armdocker.rnd.ericsson.se/proj-adp-cicd-drop/trivy-inline-scan:${env.TRIVY_INLINE_TAG}
+
+# List of constants
+properties:
+- common-ruleset-name: eric-enm-common-ruleset
+- docker-image-path: ""
+- docker-internal-image-path: ""
+- helm-chart-name: ""
+- helm-chart-repo: ""
+- image-name: ""
+- image-registry: armdocker.rnd.ericsson.se
+- image-repo: ""
+- sidecar-docker-image-path: ""
+- sidecar-image-name: ""
+
+# Import environment variables (e.g. Jenkins parameters)
+env:
+  - ADP_HELM_DR_CHECK_TAG (default=latest)
+  - ADP_RELEASE_AUTO_TAG (default=latest)
+  - ANCHORE_INLINE_TAG (default=latest)
+  - ARM_COMMON_RULESET_REPO (default=proj-eric-oss-drop-generic)
+  - ARM_SERVER_FQDN (default=arm.seli.gic.ericsson.se)
+  - ARM_USER (default=lciadm100)
+  - ARM_XRAY_SELI_SERVER
+  - AUTHOR_EMAIL
+  - AUTHOR_NAME
+  - BUILD_DATE (default = $(date +%d%m%Y-%H%M%S --utc))
+  - COMMON_RULESET_VERSION (default=latest)
+  - CREDENTIALS_SELI_ARTIFACTORY_PSW
+  - CREDENTIALS_SELI_ARTIFACTORY_USR
+  - CREDENTIALS_SERO_ARTIFACTORY_PSW
+  - CREDENTIALS_SERO_ARTIFACTORY_USR
+  - ENABLE_HELM_V3 (default=true)
+  - ENM_VERSION_AUTO_TAG (default=latest)
+  - ENM_YQ_TAG (default=latest)
+  - GIT_COMMITTER_EMAIL
+  - GIT_COMMITTER_NAME
+  - HELM_REPO_TOKEN
+  - IMAGE_NAME
+  - IMAGE_VERSION
+  - ISO_VERSION (default=1.0.5555)
+  - K8_TEST_TAG (default=latest)
+  - KUBECONFIG (default=$PWD/.kube/config)
+  - PROJECT_NAME
+  - PWD
+  - RELEASE (default=true)
+  - TRIVY_INLINE_TAG (default=latest)
+
+var:
+  - IMAGETOSCAN
+  - RELEASE_NAMESPACE_ENV
+  - REPORT_FORMAT
+  - SERVICE_NAME_ENV
+  - SERVICE_VERSION_ENV
+  - commit-hash
+  - rstate
+  - version
+  - version-prefix
+
+# Rules to execute
+rules:
+
+  generate-new-version:
+    - task: generate-version
+      docker-image: adp-release-auto
+      cmd: generate-version -f VERSION_PREFIX --is-release ${env.RELEASE} --output version
+    - task: set-version-prefix
+      cmd: cat VERSION_PREFIX > .bob/var.version-prefix
+    - task: generate-rstate
+      docker-image: adp-release-auto
+      cmd: get_rstate.py ${var.version} > .bob/var.rstate
+    - task: get-commit-hash
+      docker-image: adp-release-auto
+      cmd: git rev-parse --short HEAD > .bob/var.commit-hash
+
+  create-git-tag:
+    - task: create-git-tag
+      docker-image: adp-release-auto
+      docker-flags:
+        - "--env GIT_COMMITTER_NAME='${env.GIT_COMMITTER_NAME}'"
+        - "--env GIT_COMMITTER_EMAIL='${env.GIT_COMMITTER_EMAIL}'"
+      cmd: git tag --annotate ${var.version} --message "Build Version ${var.version} by ${env.AUTHOR_NAME} <${env.AUTHOR_EMAIL}>"
+
+  remove-git-tag:
+    - task: remove-git-tag
+      docker-image: adp-release-auto
+      cmd: git tag --delete ${var.version}
+
+  anchore-inline-scan:
+    - task: fetch-image
+      cmd: "docker pull ${var.IMAGETOSCAN}"
+    - task: anchore-inline-scan
+      docker-image: anchore-inline-scan
+      docker-flags:
+      - -v /var/run/docker.sock:/var/run/docker.sock
+      - -v $PWD:$PWD
+      - $(for x in $(id -G); do printf " --group-add %s" "$x"; done)
+      cmd: scan ${var.IMAGETOSCAN}
+
+  trivy-scan:
+    - task: trivy-inline-scan
+      docker-image: trivy-inline-scan
+      docker-in-docker: socket
+      cmd: --format ${var.REPORT_FORMAT} --output trivy_scan.report ${var.IMAGETOSCAN}
+
+    - task: trivy-inline-scan-with-filter-exitcode
+      docker-image: trivy-inline-scan
+      docker-in-docker: socket
+      cmd: --format ${var.REPORT_FORMAT} --output trivy_scan.report --severity HIGH,CRITICAL --exit-code 1 ${var.IMAGETOSCAN}
+
+    - task: trivy-inline-scan-with-tar
+      docker-image: trivy-inline-scan
+      docker-in-docker: socket
+      cmd: --format ${var.REPORT_FORMAT} --output trivy_scan.report --input ${var.IMAGETOSCAN}
+
+    - task: trivy-inline-scan-with-tar-filter-exitcode
+      docker-image: trivy-inline-scan
+      docker-in-docker: socket
+      cmd: --format ${var.REPORT_FORMAT} --output trivy_scan.report --severity HIGH,CRITICAL --exit-code 1 --input ${var.IMAGETOSCAN}
+
+  zap-test:
+    - task: zap-scan
+      docker-image: k8-test
+      docker-flags:
+        - "--env KUBECONFIG=/tmp/admin.conf"
+        - "--volume ${env.KUBECONFIG}:/tmp/admin.conf:ro"
+        - "--volume ${env.PWD}:${env.PWD}"
+      cmd:  /test.py
+              -n ${var.RELEASE_NAMESPACE_ENV}
+              -k /tmp/admin.conf
+              -u ${env.CREDENTIALS_SERO_ARTIFACTORY_USR}
+              -t ${env.CREDENTIALS_SERO_ARTIFACTORY_PSW}
+              --only-zap-test
+              -zf zap_config.yaml
+
+  fetch-xray-report:
+    - task: fetch-VA-report
+      docker-image: adp-release-auto
+      cmd: fetch_report.py
+        --user ${env.CREDENTIALS_SELI_ARTIFACTORY_USR}
+        --apikey ${env.CREDENTIALS_SELI_ARTIFACTORY_PSW}
+        --project ${env.PROJECT_NAME}
+        --image ${env.IMAGE_NAME}:${env.IMAGE_VERSION}
+        --server ${env.ARM_XRAY_SELI_SERVER}

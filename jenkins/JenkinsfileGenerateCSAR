@@ -1,0 +1,128 @@
+import jdk.nashorn.internal.objects.NativeString
+@Library('son-dev-utils-shared-library')
+import jenkins.utils.*
+
+utils = new utils()     // https://gerrit.ericsson.se/gitweb?p=OSS/com.ericsson.oss.services.sonom/son-dev-utils.git;a=blob_plain;f=src/jenkins/utils/utils.groovy;hb=master
+
+def remote = [:]
+
+pipeline {
+    agent {
+        node {
+            label SLAVE
+        }
+    }
+    options {
+        skipDefaultCheckout true
+        timestamps()
+        timeout(time: 75, unit: 'MINUTES')
+    }
+    environment {
+        CREDENTIALS_SEKA_ARTIFACTORY = credentials('ejenksonomArtifactoryApiKey')
+        CREDENTIALS_RELEASE_SERVER = credentials('releaseServerCredentials')
+    }
+    stages {
+        stage('Clean') {
+            steps {
+                sh '''
+                    echo "Cleanup workspace:"
+                    sudo chmod -fR 777 "${WORKSPACE}"
+                    sudo rm -Rf ./*
+                '''
+
+                echo 'Free up space to allow enough space for build:'
+                sh "docker rmi \$(docker images -q) --force || true"
+                sh "sudo rm -rf ${HOME}/.m2"
+
+                echo 'SCM Checkout:'
+                checkout scm
+            }
+        }
+        stage('Init') {
+            steps {
+                script {
+                    echo 'Modify the build description:'
+                    currentBuild.description = "Generating CSAR for ${params.CHART_NAME}-${params.CHART_VERSION}"
+
+                    echo 'Add jenkins scripts to workspace:'
+                    dir('son-dev-utils') {
+                        git branch: "${params.SON_DEV_UTILS_BRANCH}", url: 'ssh://gerrit.ericsson.se:29418/OSS/com.ericsson.oss.services.sonom/son-dev-utils.git'
+                    }
+                    sh "mkdir -p ${env.WORKSPACE}/scripts/"
+                    sh "mv ${env.WORKSPACE}/son-dev-utils/scripts/csar-jenkins-scripts/* ${env.WORKSPACE}/scripts/"
+                    sh "rm -rf ${env.WORKSPACE}/son-dev-utils/"
+
+                    echo 'Add common CSAR scripts to workspace:'
+                    sh "mkdir -p ${env.WORKSPACE}/packaging/scripts/"
+                    utils.addSonCommonCsarScriptsToWs()
+
+                    echo 'Add CSAR specific site config files to workspace:'
+                    dir("${params.CHART_NAME}") {
+                        git branch: "${params.CSAR_REPO_BRANCH}", url: "ssh://gerrit.ericsson.se:29418/${params.CSAR_REPO_NAME}.git"
+                    }
+                    sh "mv ${env.WORKSPACE}/${params.CHART_NAME}/packaging/scripts/*.yaml ${env.WORKSPACE}/packaging/scripts/"
+                    sh "rm -rf ${env.WORKSPACE}/${params.CHART_NAME}"
+
+                    archiveArtifacts allowEmptyArchive: true, artifacts: "${env.WORKSPACE}/packaging/scripts/*"
+
+                    echo 'Setup remote server info:'
+                    remote.name = "${params.PUBLISH_REMOTE_NAME}"
+                    remote.host = "${params.PUBLISH_REMOTE_HOST}"
+                    remote.user = CREDENTIALS_RELEASE_SERVER_USR
+                    remote.password = CREDENTIALS_RELEASE_SERVER_PSW
+                    remote.allowAnyHosts = true
+                }
+            }
+        }
+        stage('Build') {
+            steps {
+                script {
+                    def statusCode = sh(script: "./scripts/generate_csar.sh ${params.CHART_NAME}-${params.CHART_VERSION} ${params.CHART_NAME} ${CREDENTIALS_SEKA_ARTIFACTORY_USR} ${CREDENTIALS_SEKA_ARTIFACTORY_PSW} ${params.DUPLICATE_IMAGES_EXCEPTION_LIST}", returnStatus: true)
+                    if (statusCode != 0) {
+                        error("Aborting the build, AM Package Manager script failed. See error in logs above.")
+                    }
+
+                    echo 'If duplicate images are found, mark the build as unstable:'
+                    findText regexp: "found duplicate images", alsoCheckConsoleOutput: true, unstableIfFound: true
+
+                    echo 'Get file size for output at end of job:'
+                    env.filesize = sh(script: "du -h ${params.CHART_NAME}-${params.CHART_VERSION}.csar | cut -f1", returnStdout: true).trim()
+                 }
+            }
+        }
+        stage('Publish') {
+            when {
+                expression { params.PUBLISH == true }
+            }
+            steps {
+                script {
+                    echo 'Keep last n builds:'
+                    //sshCommand remote: remote, command: "ls -d -1tr ${params.PUBLISH_REMOTE_DIRECTORY}/${params.CHART_NAME}/csars/*.csar | head -n -7 | xargs -d '\n' rm -f *.csar"
+
+                    echo 'Put CSAR package on release server:'
+                    sshCommand remote: remote, command: "cd ${params.PUBLISH_REMOTE_DIRECTORY} && mkdir -p ${params.CHART_NAME}/csars/"
+                    sshPut remote: remote, from: "${params.CHART_NAME}-${params.CHART_VERSION}.csar", into: "${params.PUBLISH_REMOTE_DIRECTORY}/${params.CHART_NAME}/csars/"
+
+                    // Add option to publish to artifactory here
+                }
+            }
+        }
+    }
+    post {
+        success {
+            script {
+                echo 'Modify the build description:'
+                echo "${params.CHART_NAME}-${params.CHART_VERSION}.csar published to ftp:////${params.PUBLISH_REMOTE_HOST}/eSON/Releases/PointFix/${params.CHART_NAME}/csars/${params.CHART_NAME}-${params.CHART_VERSION}.csar"
+                currentBuild.description = "<a href=ftp:////${params.PUBLISH_REMOTE_HOST}/eSON/Releases/PointFix/${params.CHART_NAME}/csars/${params.CHART_NAME}-${params.CHART_VERSION}.csar> ${params.CHART_NAME}-${params.CHART_VERSION}.csar</a> ($filesize)"
+            }
+        }
+        always {
+            step([$class: 'ClaimPublisher'])
+            sh '''
+                echo "Cleanup workspace:"
+                sudo chmod -fR 777 "${WORKSPACE}"
+                sudo rm -Rf ./*
+            '''
+        }
+    }
+}

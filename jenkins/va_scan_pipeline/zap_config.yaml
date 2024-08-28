@@ -1,0 +1,18 @@
+zapConfig:
+  baseUrl: "http://service_name.namespace:service_port"
+  scanType: "api"
+  config_dir: "zap/config"
+  globalConfig:
+  endpoints:
+    - name: "endpoint_root"
+      url: "/"
+      config:
+  report:
+    dir: "zap/reports"
+    format:
+      - html
+      - json
+      - md
+      - xml
+  properties:
+    zap_container_port: 4040

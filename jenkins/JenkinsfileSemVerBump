@@ -1,0 +1,114 @@
+@Library('son-dev-utils-shared-library')
+import jenkins.utils.*
+
+logging = new logging() // https://gerrit.ericsson.se/gitweb?p=OSS/com.ericsson.oss.services.sonom/son-dev-utils.git;a=blob_plain;f=src/jenkins/utils/logging.groovy;hb=master
+utils = new utils()     // https://gerrit.ericsson.se/gitweb?p=OSS/com.ericsson.oss.services.sonom/son-dev-utils.git;a=blob_plain;f=src/jenkins/utils/utils.groovy;hb=master
+
+pipeline {
+    agent {
+        node {
+            label SLAVE
+        }
+    }
+    tools {
+        jdk 'jdk8'
+        maven 'maven'
+    }
+    options {
+        skipDefaultCheckout true
+        timestamps()
+        timeout(time: 30, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '40', artifactNumToKeepStr: '20'))
+    }
+
+    stages {
+        stage('Clean') {
+            steps {
+                sh '''
+                    echo "Cleanup workspace"
+                    sudo chmod -fR 777 "${WORKSPACE}"
+                    sudo rm -Rf ./*
+                '''
+
+
+            }
+        }
+        stage('Init'){
+            steps{
+                script{
+                    echo 'Inject maven settings.xml file'
+                    configFileProvider([configFile(fileId: "gazelles-settings.xml", targetLocation: "${HOME}/.m2/settings.xml")]) {}
+
+                    def repoName = mapOfServiceNames(SERVICE_NAME)
+                    print "Repo name is $repoName"
+                    checkout([$class: 'GitSCM', branches: [[name: '*/master']],extensions: [[$class: 'RelativeTargetDirectory',
+                    relativeTargetDir: '.']],userRemoteConfigs: [[url: "ssh://gerrit.sero.gic.ericsson.se:29418/${repoName}.git"]]])
+                }
+            }
+        }
+        stage('Confirmation'){
+            steps {
+                script {
+                    currentBuild.description = "Are you sure you want to bump the version?"
+                }
+                input "Are you sure you want to bump the ${SEMVER_FIELD_TO_BE_BUMPED} version for ${SERVICE_NAME}?"
+            }
+        }
+        stage('Bump Version') {
+            steps {
+                script {
+
+                    sh 'hostname'
+                    if (env.SEMVER_FIELD_TO_BE_BUMPED == "patch") {
+                        sh 'cat VERSION_PREFIX'
+                        sh 'mvn org.apache.maven.plugins:maven-help-plugin:3.1.0:evaluate -Dexpression=project.version -q -DforceStdout -s ${HOME}/.m2/settings.xml | cut -d "-" -f1 > VERSION_PREFIX'
+                        sh 'cat VERSION_PREFIX'
+                    }
+                    Version = readFile "VERSION_PREFIX"
+                    sh 'docker run --rm -v $PWD/VERSION_PREFIX:/app/VERSION -w /app armdocker.rnd.ericsson.se/proj-enm/bump $SEMVER_FIELD_TO_BE_BUMPED'
+                    newVersion = readFile "VERSION_PREFIX"
+                    env.IMAGE_VERSION = newVersion.trim()
+                    sh 'cat VERSION_PREFIX'
+                    sh 'mvn versions:set -DnewVersion=$IMAGE_VERSION-SNAPSHOT -s ${HOME}/.m2/settings.xml'
+
+                    if (env.PUSH_COMMIT == "true") {
+                        sh '''
+                            git add .
+                            git commit -m "[ci-skip] Version ${IMAGE_VERSION}"
+                            git push origin HEAD:master
+                        '''
+                        currentBuild.description = "[${SERVICE_NAME}] - ${SEMVER_FIELD_TO_BE_BUMPED} version bumped to " + newVersion
+                    } else {
+                        currentBuild.description = "PUSH_COMMIT set to false, no commit was made.\n[${SERVICE_NAME}] ${SEMVER_FIELD_TO_BE_BUMPED} version NOT bumped to " + newVersion
+                    }
+                }
+            }
+        }
+
+    }
+
+}
+def mapOfServiceNames(SERVICE_NAME) {
+    echo "Mapping the service ${SERVICE_NAME} to the Gerrit repo"
+
+    repoName = [
+        "eric-identity-service"             :     "OSS/com.ericsson.oss.services.sonom/identity-service",
+        "eric-aut-policy-engine-ax"         :     "OSS/com.ericsson.oss.services.sonom/policy-engine",
+        "eric-cm-change-mediator-er"        :     "OSS/com.ericsson.oss.services.sonom/change-activation-service-enm",
+        "eric-cm-loader-er"                 :     "OSS/com.ericsson.oss.services.sonom/cm-data-loading-service-enm",
+        "eric-cm-topology-model-sn"         :     "OSS/com.ericsson.oss.services.sonom/cm-service",
+        "eric-nfs-provisioner"              :     "OSS/com.ericsson.oss.services.sonom/nfs-provisioner",
+        "eric-nm-repository"                :     "OSS/com.ericsson.oss.services.sonom/oss-repository-service",
+        "eric-pm-events-processor-er"       :     "OSS/com.ericsson.oss.services.sonom/pm-events-processor-enm",
+        "eric-pm-stats-processor-er"        :     "OSS/com.ericsson.oss.services.sonom/pm-stats-processor-enm",
+        "eric-pm-kpi-calculator"            :     "OSS/com.ericsson.oss.services.sonom/kpi-service",
+        "eric-pm-push-gateway"              :     "OSS/com.ericsson.oss.services.sonom/pm-push-gateway",
+        "eric-son-frequency-layer-manager"  :     "OSS/com.ericsson.oss.services.sonom/frequency-layer-manager",
+        "eric-son-ret-algorithm"            :     "OSS/com.ericsson.oss.services.sonom/ret-service",
+        "eric-ldap-postgresql-sync"         :     "OSS/com.ericsson.oss.services.sonom/ldap-postgresql-sync-service",
+        "eric-data-engine-sk"               :     "AIA/microservices/spark",
+        "eric-schema-registry-sr"           :     "AIA/microservices/schemaregistry",
+        "eric-event-data-collector"         :     "AIA/microservices/ctr-parser"
+    ]
+    return repoName.get(params.SERVICE_NAME) ?: []
+}

@@ -1,0 +1,2 @@
+# Bash requires that lines end in '\n'.
+*.sh text eol=lf

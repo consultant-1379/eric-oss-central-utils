@@ -1,0 +1,84 @@
+modelVersion: 2.0
+
+docker-images:
+  - anchore-inline-scan: armdocker.rnd.ericsson.se/proj-adp-cicd-drop/anchore-inline-scan:latest
+  - trivy-inline-scan: armdocker.rnd.ericsson.se/proj-adp-cicd-drop/trivy-inline-scan:latest
+  - k8-test: armdocker.rnd.ericsson.se/proj-adp-cicd-drop/bob-py3kubehelmbuilder:latest
+  - adp-release-auto: armdocker.rnd.ericsson.se/proj-adp-cicd-drop/bob-adp-release-auto:latest
+
+env:
+  - KUBECONFIG (default=$PWD/.kube/config)
+  - PWD
+  - CREDENTIALS_SERO_ARTIFACTORY_USR
+  - CREDENTIALS_SERO_ARTIFACTORY_PSW
+  - PROJECT_NAME
+  - IMAGE_NAME
+  - IMAGE_VERSION
+  - ARM_XRAY_SELI_SERVER
+  - CREDENTIALS_SELI_ARTIFACTORY_USR
+  - CREDENTIALS_SELI_ARTIFACTORY_PSW
+
+var:
+  - IMAGETOSCAN
+  - REPORT_FORMAT
+  - SERVICE_NAME_ENV
+  - SERVICE_VERSION_ENV
+  - RELEASE_NAMESPACE_ENV
+
+rules:
+  anchore-inline-scan:
+    - task: fetch-image
+      cmd: "docker pull ${var.IMAGETOSCAN}"
+    - task: anchore-inline-scan
+      docker-image: anchore-inline-scan
+      docker-flags:
+        - -v /var/run/docker.sock:/var/run/docker.sock
+        - -v $PWD:$PWD
+        - $(for x in $(id -G); do printf " --group-add %s" "$x"; done)
+      cmd: scan ${var.IMAGETOSCAN}
+
+  trivy-scan:
+    - task: trivy-inline-scan
+      docker-image: trivy-inline-scan
+      docker-in-docker: socket
+      cmd: --format ${var.REPORT_FORMAT} --output trivy_scan.report ${var.IMAGETOSCAN}
+
+    - task: trivy-inline-scan-with-filter-exitcode
+      docker-image: trivy-inline-scan
+      docker-in-docker: socket
+      cmd: --format ${var.REPORT_FORMAT} --output trivy_scan.report --severity HIGH,CRITICAL --exit-code 1 ${var.IMAGETOSCAN}
+
+    - task: trivy-inline-scan-with-tar
+      docker-image: trivy-inline-scan
+      docker-in-docker: socket
+      cmd: --format ${var.REPORT_FORMAT} --output trivy_scan.report --input ${var.IMAGETOSCAN}
+
+    - task: trivy-inline-scan-with-tar-filter-exitcode
+      docker-image: trivy-inline-scan
+      docker-in-docker: socket
+      cmd: --format ${var.REPORT_FORMAT} --output trivy_scan.report --severity HIGH,CRITICAL --exit-code 1 --input ${var.IMAGETOSCAN}
+
+  zap-test:
+    - task: zap-scan
+      docker-image: k8-test
+      docker-flags:
+        - "--env KUBECONFIG=/tmp/admin.conf"
+        - "--volume ${env.KUBECONFIG}:/tmp/admin.conf:ro"
+        - "--volume ${env.PWD}:${env.PWD}"
+      cmd:  /test.py
+        -n ${var.RELEASE_NAMESPACE_ENV}
+        -k /tmp/admin.conf
+        -u ${env.CREDENTIALS_SERO_ARTIFACTORY_USR}
+        -t ${env.CREDENTIALS_SERO_ARTIFACTORY_PSW}
+        --only-zap-test
+        -zf zap_config.yaml
+
+  fetch-xray-report:
+    - task: fetch-VA-report
+      docker-image: adp-release-auto
+      cmd: fetch_report.py
+        --user ${env.CREDENTIALS_SELI_ARTIFACTORY_USR}
+        --apikey ${env.CREDENTIALS_SELI_ARTIFACTORY_PSW}
+        --project ${env.PROJECT_NAME}
+        --image ${env.IMAGE_NAME}:${env.IMAGE_VERSION}
+        --server ${env.ARM_XRAY_SELI_SERVER}
